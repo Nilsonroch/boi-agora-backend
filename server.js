@@ -1,5 +1,4 @@
 import express from 'express';
-import { chromium } from 'playwright';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,6 +31,21 @@ function decodeEntities(text = '') {
     .replace(/&uuml;/gi, 'ü');
 }
 
+function stripHtmlWithLines(html = '') {
+  return decodeEntities(
+    html
+      .replace(/<\/(tr|p|div|li|h1|h2|h3|h4|br|table|thead|tbody|td|th|section|article)>/gi, '\n')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\r/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{2,}/g, '\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim()
+  );
+}
+
 function stripHtml(text = '') {
   return decodeEntities(
     text
@@ -43,8 +57,7 @@ function stripHtml(text = '') {
 }
 
 function toLines(text = '') {
-  return decodeEntities(text)
-    .replace(/\r/g, '\n')
+  return text
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
@@ -74,42 +87,32 @@ function percentText(value) {
   return `${signal}${num.toFixed(2).replace('.', ',')}%`;
 }
 
-async function scrapePageText(browser, url) {
-  const page = await browser.newPage({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    locale: 'pt-BR',
-  });
+async function fetchText(url, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(3500);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        referer: 'https://www.google.com/',
+        pragma: 'no-cache',
+        'cache-control': 'no-cache',
+      },
+    });
 
-    const content = await page.content();
-    const bodyText = await page.locator('body').innerText().catch(() => '');
+    if (!response.ok) {
+      throw new Error(`Falha ao buscar ${url}: ${response.status}`);
+    }
 
-    return {
-      html: decodeEntities(content),
-      text: decodeEntities(bodyText || ''),
-    };
+    return await response.text();
   } finally {
-    await page.close();
+    clearTimeout(timeout);
   }
-}
-
-async function fetchNewsXml(url) {
-  const res = await fetch(url, {
-    headers: {
-      'user-agent': 'Mozilla/5.0',
-      accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Falha ao buscar notícias: ${res.status}`);
-  }
-
-  return res.text();
 }
 
 function extractNewsItems(xml, maxItems = 6) {
@@ -268,12 +271,12 @@ function parseFuturo(lines) {
   };
 }
 
-function buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt) {
+function buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt, warnings = []) {
   return {
     collectedAt: new Date().toISOString(),
     sourceUpdatedAt: sourceUpdatedAt || null,
     updatedAt: new Date().toISOString(),
-    status: 'Atualizado',
+    status: warnings.length ? 'Parcial' : 'Atualizado',
     location: plaza === 'sao-paulo' ? 'São Paulo' : 'Goiás',
     arroba: boi
       ? {
@@ -295,12 +298,12 @@ function buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt) {
         }
       : null,
     graos: {
-      milho: graos.milho ? moneySaca(graos.milho.value) : null,
-      milhoPraca: graos.milho?.praca || null,
-      milhoNote: graos.milho?.note || '',
-      soja: graos.soja ? moneySaca(graos.soja.value) : null,
-      sojaPraca: graos.soja?.praca || null,
-      sojaNote: graos.soja?.note || '',
+      milho: graos?.milho ? moneySaca(graos.milho.value) : null,
+      milhoPraca: graos?.milho?.praca || null,
+      milhoNote: graos?.milho?.note || '',
+      soja: graos?.soja ? moneySaca(graos.soja.value) : null,
+      sojaPraca: graos?.soja?.praca || null,
+      sojaNote: graos?.soja?.note || '',
       source: 'Scot Consultoria / AgRural',
     },
     noticias,
@@ -310,7 +313,7 @@ function buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt) {
       { name: 'Scot Consultoria - Mercado futuro', url: URL_FUTURO },
       { name: 'Google News', url: 'https://news.google.com/' },
     ],
-    warning: '',
+    warning: warnings.join(' | '),
   };
 }
 
@@ -320,63 +323,54 @@ app.get('/health', (_req, res) => {
 
 app.get('/cotacoes', async (req, res) => {
   const plaza = req.query.plaza === 'sao-paulo' ? 'sao-paulo' : 'goias';
-  let browser;
+  const warnings = [];
 
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
+  const [boiResult, graosResult, futuroResult, newsResult] = await Promise.allSettled([
+    fetchText(URL_BOI, 15000),
+    fetchText(URL_GRAOS, 15000),
+    fetchText(URL_FUTURO, 12000),
+    fetchText(URL_NEWS, 15000),
+  ]);
 
-    const [boiPage, graosPage, futuroPage, newsXml] = await Promise.all([
-      scrapePageText(browser, URL_BOI),
-      scrapePageText(browser, URL_GRAOS),
-      scrapePageText(browser, URL_FUTURO),
-      fetchNewsXml(URL_NEWS),
-    ]);
+  let boi = null;
+  let graos = null;
+  let futuro = null;
+  let noticias = [];
+  let sourceUpdatedAt = null;
 
-    const boiLines = toLines(boiPage.text);
-    const graosLines = toLines(graosPage.text);
-    const futuroLines = toLines(futuroPage.text);
-
-    const sourceUpdatedAt = parsePublishedAt(boiLines);
-    const boi = parseBoiByPlaza(boiLines, plaza);
-    const graos = parseGraosByPlaza(graosLines, plaza);
-    const futuro = parseFuturo(futuroLines);
-    const noticias = extractNewsItems(newsXml, 6);
-
-    res.json(buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt));
-  } catch (error) {
-    res.status(200).json({
-      collectedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: 'Contingência',
-      location: plaza === 'sao-paulo' ? 'São Paulo' : 'Goiás',
-      warning: 'Não foi possível buscar as cotações no momento.',
-      debug: error instanceof Error ? error.message : 'Erro desconhecido',
-      arroba: null,
-      futuro: null,
-      graos: {
-        milho: null,
-        milhoPraca: null,
-        milhoNote: '',
-        soja: null,
-        sojaPraca: null,
-        sojaNote: '',
-        source: 'Scot Consultoria / AgRural',
-      },
-      noticias: [],
-      sources: [
-        { name: 'Scot Consultoria - Boi gordo', url: URL_BOI },
-        { name: 'Scot Consultoria - Grãos', url: URL_GRAOS },
-        { name: 'Scot Consultoria - Mercado futuro', url: URL_FUTURO },
-      ],
-    });
-  } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+  if (boiResult.status === 'fulfilled') {
+    const boiLines = toLines(stripHtmlWithLines(boiResult.value));
+    sourceUpdatedAt = parsePublishedAt(boiLines);
+    boi = parseBoiByPlaza(boiLines, plaza);
+    if (!boi) warnings.push('Arroba não localizada na fonte');
+  } else {
+    warnings.push('Falha na fonte de arroba');
   }
+
+  if (graosResult.status === 'fulfilled') {
+    const graosLines = toLines(stripHtmlWithLines(graosResult.value));
+    graos = parseGraosByPlaza(graosLines, plaza);
+    if (!graos?.milho) warnings.push('Milho não localizado na fonte');
+    if (!graos?.soja) warnings.push('Soja não localizada na fonte');
+  } else {
+    warnings.push('Falha na fonte de grãos');
+  }
+
+  if (futuroResult.status === 'fulfilled') {
+    const futuroLines = toLines(stripHtmlWithLines(futuroResult.value));
+    futuro = parseFuturo(futuroLines);
+    if (!futuro) warnings.push('Mercado futuro não localizado na fonte');
+  } else {
+    warnings.push('Falha na fonte de mercado futuro');
+  }
+
+  if (newsResult.status === 'fulfilled') {
+    noticias = extractNewsItems(newsResult.value, 6);
+  } else {
+    warnings.push('Falha na fonte de notícias');
+  }
+
+  res.json(buildPayload(plaza, boi, futuro, graos, noticias, sourceUpdatedAt, warnings));
 });
 
 app.listen(PORT, () => {
